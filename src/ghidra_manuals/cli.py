@@ -6,9 +6,18 @@ import json
 import requests
 import pathlib
 import os
+import shutil
+from importlib.resources import files
 
+# Path the user-facing CLI/messages refer to. Either the user's --config
+# argument, or "config.json" in the current working directory by default.
 CONFIG_FILE = "config.json"
 SAVE_DIR = "pdfs"
+
+
+def bundled_config_path() -> pathlib.Path:
+    """Return path to the config.json bundled inside the installed package."""
+    return pathlib.Path(str(files("ghidra_manuals").joinpath("config.json")))
 
 manual_config_skel = {
     "info": "",
@@ -29,7 +38,7 @@ def get_real_path(path):
 
     return path[:path.index(idx_name)]
 
-def get_idx_files_headers(ghidra_path, current_config={}):
+def get_idx_files_headers(ghidra_path, current_config={}, write_to=None):
     # https://stackoverflow.com/questions/18394147/how-to-do-a-recursive-sub-folder-search-and-return-files-in-a-list
     idx_paths = list(pathlib.Path(ghidra_path).rglob("*.idx"))
 
@@ -86,7 +95,7 @@ def get_idx_files_headers(ghidra_path, current_config={}):
         missing_filenames = set(filenames_new) - set(filenames_current)
 
         if not missing_filenames:
-            print(f"Did not update {CONFIG_FILE} as there were no missing manuals...")
+            print(f"Did not update {write_to or CONFIG_FILE} as there were no missing manuals...")
             return current_config
 
         for missing_filename in missing_filenames:
@@ -106,11 +115,12 @@ def get_idx_files_headers(ghidra_path, current_config={}):
     else:
         current_config = new_config
 
-    with open(CONFIG_FILE, "w") as config_json_f:
+    out_path = pathlib.Path(write_to) if write_to else pathlib.Path(CONFIG_FILE)
+    with open(out_path, "w") as config_json_f:
         json.dump(current_config, config_json_f, indent=4)
 
-    print(f"Manuals info dumped to {CONFIG_FILE}")
-    
+    print(f"Manuals info dumped to {out_path}")
+
     return current_config
 
 def check_folder_exists(folder_path, make=False):
@@ -194,13 +204,43 @@ def download_pdf_and_store(urls, filepath, filename, ghidra_path, no_cache):
 
     return True
 
-def load_config():
-    if not os.path.exists(CONFIG_FILE):
-        print("If it does not exist you can run get.py to create it but manually fill URLs.")
-        bailout(f"Could not find config file {CONFIG_FILE}.\n"
-                "If it does not exist you can run get.py to create it but manually fill URLs.")
-    with open(CONFIG_FILE, "r") as config_f:
+def load_config(config_path):
+    if not os.path.exists(config_path):
+        bailout(f"Could not find config file {config_path}.")
+    with open(config_path, "r") as config_f:
         return json.load(config_f)
+
+
+def resolve_config_path(user_config):
+    """Pick which config.json to read from.
+
+    Order of preference:
+      1. ``--config`` if explicitly provided by the user.
+      2. ``./config.json`` in the current working directory if it exists
+         (so contributors working in a checkout keep the old behavior).
+      3. The ``config.json`` bundled with the installed package.
+    """
+    if user_config:
+        return pathlib.Path(user_config)
+
+    cwd_config = pathlib.Path(CONFIG_FILE)
+    if cwd_config.exists():
+        return cwd_config
+
+    return bundled_config_path()
+
+
+def resolve_config_write_path(user_config):
+    """Pick which config.json to write to.
+
+    If the user passed ``--config``, honor it. Otherwise default to
+    ``./config.json`` in the current working directory — never write back
+    into the package's bundled copy.
+    """
+    if user_config:
+        return pathlib.Path(user_config)
+    return pathlib.Path(CONFIG_FILE)
+
 
 def main(args):
 
@@ -210,22 +250,30 @@ def main(args):
     if not check_folder_exists(pathlib.Path(args.ghidra_path + "/Ghidra/").as_posix()):
         bailout("Ghidra path given does not contain a ghidra installation.")
 
+    read_config_path = resolve_config_path(args.config)
+    write_config_path = resolve_config_write_path(args.config)
+
     # Get the new manual_idxs without worrying about if config.json is okay
     if args.overwrite_config and args.get_manual_idxs:
-        print(f"Overwriting current {CONFIG_FILE}. URLs will be cleared.")
-        get_idx_files_headers(args.ghidra_path)
+        print(f"Overwriting current {write_config_path}. URLs will be cleared.")
+        get_idx_files_headers(args.ghidra_path, write_to=write_config_path)
 
-    config = load_config()
+    config = load_config(read_config_path)
     if not (isinstance(config, dict) and 'manuals' in config):
         bailout("Config file is not set up properly.")
     
     # Done down here AFTER the config load since we we'll be updating the config
     if args.get_manual_idxs and not args.overwrite_config:
         print("Updating manual config json with current ghidra install")
-        get_idx_files_headers(args.ghidra_path, config)
-    
+        # If the read came from the bundled package and the user didn't
+        # request a specific path, seed the cwd config from the bundled one
+        # before writing additions.
+        if not args.config and not pathlib.Path(CONFIG_FILE).exists():
+            shutil.copyfile(bundled_config_path(), write_config_path)
+        get_idx_files_headers(args.ghidra_path, config, write_to=write_config_path)
+
     if args.get_manual_idxs:
-        print(f"\nDone updating {CONFIG_FILE}.")
+        print(f"\nDone updating {write_config_path}.")
         exit(0)
 
     print("Getting manuals...\n")
@@ -254,18 +302,25 @@ def main(args):
         else:
             print(f"WARNING: Could not get manual: {filename}.\n")
 
-if __name__ == "__main__":
+def cli():
     parser = argparse.ArgumentParser(description="Get ghidra manuals from the internet and put into your ghidra installation")
 
     parser.add_argument("ghidra_path",
                         help="Path to ghidra installation",
                         metavar="~/ghidra_xx.xx")
 
+    parser.add_argument("--config",
+                        help=("Path to a config.json to use. Defaults to "
+                              "./config.json if it exists, otherwise the "
+                              "config.json bundled with this package."),
+                        metavar="PATH",
+                        default=None)
+
     parser.add_argument("--get-manual-idxs",
                         help=f"Update {CONFIG_FILE} to include manuals from current ghidra installation",
                         action="store_true",
                         default=False)
-    
+
     parser.add_argument("--overwrite-config",
                         help=f"""\
 Overwrite {CONFIG_FILE} with the new manual indexes. \
@@ -281,3 +336,7 @@ This is not typically what you want to do. Will clear current URLs from {CONFIG_
     args = parser.parse_args()
 
     main(args)
+
+
+if __name__ == "__main__":
+    cli()

@@ -11,7 +11,7 @@ import pathlib
 import hashlib
 
 
-with open("../config.json", "r") as f:
+with open("../src/ghidra_manuals/config.json", "r") as f:
     data = json.load(f)
 
 def check_url_status_and_type(url, path, filename):
